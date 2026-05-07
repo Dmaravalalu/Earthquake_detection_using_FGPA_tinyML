@@ -1,0 +1,6 @@
+.venv/
+.venv-tf/
+__pycache__/
+out/
+ACCESS2947848.pdf
+synopsis-2.pdf
