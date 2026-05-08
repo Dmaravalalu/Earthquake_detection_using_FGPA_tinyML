@@ -26,6 +26,7 @@ Usage
   python convert_to_hls.py        # do NOT set TF_USE_LEGACY_KERAS=1
 """
 
+import argparse
 import os
 # Force pure Keras 3 mode — hls4ml 1.3 requires it
 os.environ.pop("TF_USE_LEGACY_KERAS", None)
@@ -49,15 +50,19 @@ CONV_FILTERS = (16, 32, 64)
 KERNEL_SIZE = 3
 POOL_SIZE = 2
 
-# HLS target
-TARGET_PART      = "xc7z020clg484-1"   # ZedBoard's Zynq-7020
-TARGET_BOARD     = "ZedBoard"
-CLOCK_PERIOD_NS  = 10                  # 100 MHz fabric clock
-
 # Quantization config (per Phase 2 QAT settings)
 DEFAULT_PRECISION = "fixed<16,6>"
 WEIGHT_PRECISION  = "fixed<8,1>"
 ACCUM_PRECISION   = "fixed<20,10>"
+
+# Common board → part lookups so users don't memorize part strings
+BOARD_PARTS = {
+    "zedboard":     ("xc7z020clg484-1", "Zynq-7020 (ZedBoard)"),
+    "cmod-a7-35":   ("xc7a35tcpg236-1", "Artix-7 35T (Cmod A7-35T)"),
+    "arty-a7-35":   ("xc7a35ticsg324-1L", "Artix-7 35T (Arty A7-35T)"),
+    "arty-a7-100":  ("xc7a100ticsg324-1L", "Artix-7 100T (Arty A7-100T)"),
+    "nexys-a7-100": ("xc7a100tcsg324-1", "Artix-7 100T (Nexys A7-100T)"),
+}
 
 
 # ── Step 1: ensure weights file exists (run extract_weights.py if not) ────────
@@ -121,7 +126,7 @@ def load_weights_into(model):
 
 
 # ── Step 3: build hls4ml config ──────────────────────────────────────────────
-def build_hls_config(model):
+def build_hls_config(model, reuse_factor=1):
     print("[3/4] Building hls4ml config …")
     import hls4ml, tensorflow as tf
 
@@ -129,7 +134,7 @@ def build_hls_config(model):
         model,
         granularity="name",
         default_precision=DEFAULT_PRECISION,
-        default_reuse_factor=1,
+        default_reuse_factor=reuse_factor,
     )
 
     config["Model"]["Strategy"] = "Latency"
@@ -147,7 +152,7 @@ def build_hls_config(model):
                 "result": DEFAULT_PRECISION,
                 "accum":  ACCUM_PRECISION,
             }
-            cfg["ReuseFactor"] = 1
+            cfg["ReuseFactor"] = reuse_factor
         elif isinstance(layer, tf.keras.layers.Dense):
             cfg["Precision"] = {
                 "weight": WEIGHT_PRECISION,
@@ -155,7 +160,7 @@ def build_hls_config(model):
                 "result": DEFAULT_PRECISION,
                 "accum":  ACCUM_PRECISION,
             }
-            cfg["ReuseFactor"] = 1
+            cfg["ReuseFactor"] = reuse_factor
         elif isinstance(layer, tf.keras.layers.BatchNormalization):
             cfg["Precision"] = {
                 "scale":  WEIGHT_PRECISION,
@@ -165,9 +170,9 @@ def build_hls_config(model):
     return config
 
 
-# ── Step 4: generate Vivado HLS project ──────────────────────────────────────
-def generate_hls_project(model, config):
-    print("[4/4] Generating Vivado HLS project tree …")
+# ── Step 4: generate HLS project ─────────────────────────────────────────────
+def generate_hls_project(model, config, args):
+    print("[4/4] Generating HLS project tree …")
     import hls4ml
 
     if HLS_PROJECT_DIR.exists():
@@ -178,36 +183,65 @@ def generate_hls_project(model, config):
         hls_config=config,
         output_dir=str(HLS_PROJECT_DIR),
         project_name="eew_cnn",
-        backend="Vivado",
-        part=TARGET_PART,
-        clock_period=CLOCK_PERIOD_NS,
+        backend=args.backend,
+        part=args.part,
+        clock_period=args.clock_period_ns,
         io_type="io_parallel",
     )
     hls_model.write()
 
     n_files = sum(1 for _ in HLS_PROJECT_DIR.rglob("*"))
     print(f"\n  HLS project tree → {HLS_PROJECT_DIR}/  ({n_files} files)")
-    print(f"  Target part      : {TARGET_PART}  ({TARGET_BOARD})")
-    print(f"  Clock period     : {CLOCK_PERIOD_NS} ns ({1000//CLOCK_PERIOD_NS} MHz)")
+    print(f"  Backend          : {args.backend}  "
+          f"(use {'vitis_hls' if args.backend == 'Vitis' else 'vivado_hls'} on host)")
+    print(f"  Target part      : {args.part}  ({args.board_label})")
+    print(f"  Clock period     : {args.clock_period_ns} ns "
+          f"({1000//args.clock_period_ns} MHz)")
     print(f"  IO type          : io_parallel")
     print(f"  Strategy         : Latency")
+    print(f"  Reuse factor     : {args.reuse_factor}  "
+          f"({'parallel' if args.reuse_factor == 1 else f'serialised x{args.reuse_factor}'})")
     print(f"  Weight precision : {WEIGHT_PRECISION}")
     print(f"  Accum precision  : {ACCUM_PRECISION}")
     print()
-    print("  Next steps (must run on a Linux/Windows host with Vivado HLS):")
+    print("  Next steps (must run on a Linux/Windows host with Vivado/Vitis):")
     print(f"     cd {HLS_PROJECT_DIR}")
-    print( "     vivado_hls -f build_prj.tcl  \"csim=1 synth=1 cosim=1 export=1\"")
-    print( "     # or open Vivado HLS GUI and import the project directory")
+    cmd = "vitis_hls" if args.backend == "Vitis" else "vivado_hls"
+    print(f"     {cmd} -f build_prj.tcl  \"csim=1 synth=1 cosim=1 export=1\"")
+    print( "     # or open the HLS GUI and import the project directory")
     print()
-    print("  See phase3.md for the full Vivado/ZedBoard deployment guide.")
+    print("  See phase3.md for the full Vivado/board deployment guide.")
 
 
 def main():
+    p = argparse.ArgumentParser(
+        description="Generate a Vivado/Vitis HLS project from the trained CNN.")
+    p.add_argument("--board", choices=list(BOARD_PARTS.keys()),
+                   default="zedboard",
+                   help="Preset target board (sets --part automatically)")
+    p.add_argument("--part", default=None,
+                   help="Override the target part (e.g. xc7a35tcpg236-1). "
+                        "If set, takes precedence over --board.")
+    p.add_argument("--backend", choices=["Vivado", "Vitis"], default="Vivado",
+                   help="Vivado HLS (≤2020.x) or Vitis HLS (≥2021.x). "
+                        "Use 'Vitis' for Vivado 2024+ / 2025.")
+    p.add_argument("--clock-period-ns", type=int, default=10,
+                   help="FPGA fabric clock period in ns. 10 ns = 100 MHz (default).")
+    p.add_argument("--reuse-factor", type=int, default=1,
+                   help="Bigger = more serialised multipliers = fewer DSPs but "
+                        "more cycles. Bump to 2 or 4 if synth says DSP overflow.")
+    args = p.parse_args()
+
+    if args.part is None:
+        args.part, args.board_label = BOARD_PARTS[args.board]
+    else:
+        args.board_label = "custom part"
+
     ensure_weights()
     model = build_keras3_model()
     load_weights_into(model)
-    config = build_hls_config(model)
-    generate_hls_project(model, config)
+    config = build_hls_config(model, reuse_factor=args.reuse_factor)
+    generate_hls_project(model, config, args)
     print("\n  Phase 3 conversion complete.")
 
 
