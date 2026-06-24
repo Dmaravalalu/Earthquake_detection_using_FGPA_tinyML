@@ -18,6 +18,7 @@ Run
   TF_USE_LEGACY_KERAS=1 streamlit run app.py
 """
 
+import json
 import os
 os.environ.setdefault("TF_USE_LEGACY_KERAS", "1")
 
@@ -35,10 +36,20 @@ from sklearn.metrics import confusion_matrix, f1_score
 from sklearn.model_selection import train_test_split
 
 from train_cnn import build_base_model, apply_qat
+from epicenter_utils import (
+    decode_azimuth,
+    decode_distance,
+    destination_point,
+    haversine_km,
+    preprocess_window,
+)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent
 TFLITE_PATH = ROOT / "out" / "eew_cnn_int8.tflite"
+EPI_MODEL_PATH = ROOT / "out" / "epicenter_cnn.keras"
+EPI_NORM_PATH  = ROOT / "out" / "epicenter_norm.json"
+EPI_METRICS_PATH = ROOT / "out" / "epicenter_metrics.json"
 CSV_PATH    = Path.home() / "Downloads" / "archive" / "merge.csv"
 HDF5_PATH   = Path.home() / "Downloads" / "archive" / "merge.hdf5"
 
@@ -46,6 +57,10 @@ WINDOW = 200
 PRE_ARRIVAL = 50
 SAMPLE_RATE = 100   # Hz
 TRACE_LEN_S = 60    # 6000 samples / 100 Hz
+
+# Epicenter side-project — must match prepare_epicenter_dataset.py
+EPI_WINDOW = 500
+EPI_PRE_ARRIVAL = 100
 
 CHANNEL_NAMES = ("Vertical (Z)", "North-South (N)", "East-West (E)")
 CHANNEL_COLORS = ("#c0392b", "#27ae60", "#2980b9")
@@ -99,9 +114,24 @@ def load_catalogue():
                               "p_arrival_sample", "s_arrival_sample",
                               "source_magnitude", "source_magnitude_type",
                               "source_depth_km", "source_distance_km",
+                              "back_azimuth_deg",
+                              "receiver_latitude", "receiver_longitude",
+                              "source_latitude", "source_longitude",
                               "snr_db"])
     df["snr_max"] = df["snr_db"].map(_parse_snr_max)
     return df
+
+
+@st.cache_resource(show_spinner="Loading epicenter model …")
+def load_epicenter_model():
+    """Loads the side-project epicenter regression model + its distance
+    encoder params. Returns (model, mu, sigma) or (None, None, None) if
+    the model hasn't been trained yet."""
+    if not EPI_MODEL_PATH.exists() or not EPI_NORM_PATH.exists():
+        return None, None, None
+    model = tf.keras.models.load_model(str(EPI_MODEL_PATH), compile=False)
+    norm = json.loads(EPI_NORM_PATH.read_text())
+    return model, float(norm["log_dist_mu"]), float(norm["log_dist_sigma"])
 
 
 def _parse_snr_max(s):
@@ -415,6 +445,166 @@ def _activation_grid(acts, win_start, peak_prob):
     return fig
 
 
+# ── UI: Epicenter tab (side-project, software-only — not on FPGA) ───────────
+def render_epicenter(row):
+    st.subheader("Epicenter regression — software-only side project")
+    st.caption(
+        "An independent second model that estimates **source distance** and "
+        "**back-azimuth** from a 5-second 3-channel crop around the P-arrival, "
+        "then uses spherical geometry (destination-point formula) to place the "
+        "epicenter on the map. Localization error is reported as a Haversine "
+        "distance to the catalogued source. **This model is not deployed on the "
+        "FPGA** — it's a separate Keras model, intended as a demo only."
+    )
+    st.warning(
+        "**Known limitation — distance is moderately predictive, back-azimuth "
+        "is essentially random.** Test-set MAE ≈ 34 km on distance but ≈ 85° "
+        "on back-azimuth (uniform random baseline ≈ 90°). Single-station "
+        "back-azimuth from raw waveforms has a fundamental ±180° ambiguity "
+        "without first-motion polarity processing — see "
+        "`epicenter_future_work.md` for the proposed redesign (band-pass "
+        "filtering, longer window, polarization features). The map dot will "
+        "land at roughly the right distance from the receiver but in a "
+        "near-random direction.",
+        icon="⚠️",
+    )
+
+    model, mu, sigma = load_epicenter_model()
+    if model is None:
+        st.error(
+            "Epicenter model not found. Train it first:\n\n"
+            "```bash\n"
+            "python prepare_epicenter_dataset.py "
+            "--csv  ~/Downloads/archive/merge.csv "
+            "--hdf5 ~/Downloads/archive/merge.hdf5 --out ./out\n"
+            "TF_USE_LEGACY_KERAS=1 python train_epicenter.py "
+            "--data ./out/epicenter_data.npz --out-dir ./out\n"
+            "```"
+        )
+        return
+
+    if row is None or row["trace_category"] != "earthquake_local":
+        st.info("Pick a **random earthquake** in the sidebar to run the "
+                "epicenter model — it only operates on earthquake traces.")
+        return
+
+    needed = ("source_distance_km", "back_azimuth_deg",
+              "receiver_latitude", "receiver_longitude",
+              "source_latitude", "source_longitude",
+              "p_arrival_sample")
+    missing = [k for k in needed if pd.isna(row.get(k))]
+    if missing:
+        st.warning(f"This trace is missing metadata for: {', '.join(missing)}. "
+                   "Pick another earthquake.")
+        return
+
+    # ── Run inference on a 500-sample crop around P ─────────────────────────
+    waveform = load_waveform(row["trace_name"])
+    p_actual = int(row["p_arrival_sample"])
+    start = p_actual - EPI_PRE_ARRIVAL
+    end = start + EPI_WINDOW
+    if start < 0 or end > waveform.shape[0]:
+        st.warning("P-arrival too close to the trace edge — "
+                   "can't take the 5-second epicenter window.")
+        return
+
+    raw_window = waveform[start:end, :].astype(np.float32)
+    # Match training: global peak norm first (as on-disk dataset is stored),
+    # then per-channel renorm with peaks kept as the aux input.
+    global_peak = float(np.max(np.abs(raw_window)))
+    if global_peak > 0:
+        raw_window = raw_window / global_peak
+    window, channel_peaks = preprocess_window(raw_window)
+
+    with st.spinner("Running epicenter regression …"):
+        pred = model.predict(
+            {"waveform": window[None], "channel_peaks": channel_peaks[None]},
+            verbose=0,
+        )
+        dist_z_pred = float(np.asarray(pred[0]).ravel()[0])
+        sin_pred    = float(np.asarray(pred[1]).ravel()[0])
+        cos_pred    = float(np.asarray(pred[2]).ravel()[0])
+
+    dist_pred = float(decode_distance(np.array([dist_z_pred]), mu, sigma)[0])
+    az_pred   = float(decode_azimuth(np.array([sin_pred]), np.array([cos_pred]))[0])
+
+    # ── Ground truth ────────────────────────────────────────────────────────
+    dist_true = float(row["source_distance_km"])
+    az_true   = float(row["back_azimuth_deg"])
+    recv_lat  = float(row["receiver_latitude"])
+    recv_lon  = float(row["receiver_longitude"])
+    src_lat   = float(row["source_latitude"])
+    src_lon   = float(row["source_longitude"])
+
+    # ── Spherical geometry → predicted epicenter coordinates ────────────────
+    pred_lat, pred_lon = destination_point(recv_lat, recv_lon, az_pred, dist_pred)
+    pred_lat = float(pred_lat); pred_lon = float(pred_lon)
+    loc_err_km = float(haversine_km(pred_lat, pred_lon, src_lat, src_lon))
+
+    # ── Metrics ─────────────────────────────────────────────────────────────
+    cols = st.columns(4)
+    cols[0].metric("Distance — true", f"{dist_true:.1f} km")
+    cols[1].metric("Distance — predicted", f"{dist_pred:.1f} km",
+                   delta=f"{dist_pred - dist_true:+.1f} km")
+    cols[2].metric("Back-az — true", f"{az_true:.1f}°")
+    az_diff = ((az_pred - az_true + 180) % 360) - 180
+    cols[3].metric("Back-az — predicted", f"{az_pred:.1f}°",
+                   delta=f"{az_diff:+.1f}°")
+
+    st.metric("Localization error (Haversine)", f"{loc_err_km:.1f} km",
+              help="Great-circle distance between catalogued source and "
+                   "epicenter computed from the model's distance + back-azimuth.")
+
+    # ── Map ─────────────────────────────────────────────────────────────────
+    st.markdown("**Map** — receiver, true epicenter, predicted epicenter")
+    map_df = pd.DataFrame([
+        {"lat": recv_lat, "lon": recv_lon, "kind": "receiver",
+         "color": [52, 152, 219], "size": 90},
+        {"lat": src_lat,  "lon": src_lon,  "kind": "true epicenter",
+         "color": [46, 204, 113], "size": 130},
+        {"lat": pred_lat, "lon": pred_lon, "kind": "predicted epicenter",
+         "color": [231, 76, 60], "size": 130},
+    ])
+    st.map(map_df, latitude="lat", longitude="lon",
+           color="color", size="size", zoom=5)
+
+    legend = " · ".join([
+        "🔵 receiver",
+        "🟢 true epicenter",
+        "🔴 predicted epicenter",
+    ])
+    st.caption(legend)
+
+    # ── Window plot ─────────────────────────────────────────────────────────
+    st.markdown("**5-second window the model saw** "
+                "(per-trace peak-normalized, P-arrival at t = 1.00 s)")
+    fig, axes = plt.subplots(3, 1, figsize=(12, 4.5), sharex=True)
+    t = np.arange(EPI_WINDOW) / SAMPLE_RATE
+    for c, (ax, name, color) in enumerate(zip(axes, CHANNEL_NAMES, CHANNEL_COLORS)):
+        ax.plot(t, window[:, c], color=color, lw=0.6)
+        ax.axvline(EPI_PRE_ARRIVAL / SAMPLE_RATE, color="black",
+                   linestyle="--", lw=0.9, label="P-arrival")
+        ax.set_ylabel(name, fontsize=8)
+        ax.grid(alpha=0.25)
+    axes[0].legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("Time (s)")
+    fig.suptitle("Epicenter model input window", fontweight="bold", fontsize=10)
+    fig.tight_layout()
+    st.pyplot(fig)
+
+    # ── Saved test-set metrics ──────────────────────────────────────────────
+    if EPI_METRICS_PATH.exists():
+        with st.expander("Saved test-set metrics from training"):
+            m = json.loads(EPI_METRICS_PATH.read_text())
+            mc = st.columns(4)
+            mc[0].metric("n test", f"{m['n_test']:,}")
+            mc[1].metric("Distance MAE", f"{m['distance_mae_km']:.1f} km")
+            mc[2].metric("Back-az MAE", f"{m['back_azimuth_mae_deg']:.1f}°")
+            mc[3].metric("Localization MAE",
+                         f"{m['localization_mae_km']:.1f} km",
+                         help=f"median {m['localization_median_km']:.1f} km")
+
+
 # ── UI: Test-set stats tab ───────────────────────────────────────────────────
 @st.cache_data(show_spinner="Splitting Phase-1 dataset to recover test set …")
 def get_test_split(seed=42, test_size=0.10):
@@ -589,14 +779,16 @@ def main():
     df = load_catalogue()
     row = sidebar_picker(df)
 
-    tab_arch, tab_demo, tab_stats = st.tabs(
-        ["Architecture", "Live demo", "Test-set stats"])
+    tab_arch, tab_demo, tab_stats, tab_epi = st.tabs(
+        ["Architecture", "Live demo", "Test-set stats", "Epicenter (side project)"])
     with tab_arch:
         render_architecture()
     with tab_demo:
         render_live_demo(row, interpreter)
     with tab_stats:
         render_test_stats()
+    with tab_epi:
+        render_epicenter(row)
 
 
 if __name__ == "__main__":
